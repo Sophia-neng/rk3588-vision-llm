@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>面试背诵手册</title>
+<style>
+  @page { margin: 15mm 12mm; size: A4; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    line-height: 1.7;
+    color: #222;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  h1 { font-size: 22px; border-bottom: 3px solid #2563eb; padding-bottom: 8px; margin-top: 0; }
+  h2 { font-size: 16px; background: #2563eb; color: #fff; padding: 6px 10px; margin-top: 28px; border-radius: 3px; }
+  h3 { font-size: 14px; border-left: 4px solid #2563eb; padding-left: 8px; margin-top: 20px; color: #1e40af; }
+  strong { color: #dc2626; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 12px; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 8px; text-align: left; }
+  th { background: #f3f4f6; font-weight: bold; }
+  code { background: #f1f5f9; padding: 1px 4px; border-radius: 2px; font-size: 12px; }
+  pre { background: #1e293b; color: #e2e8f0; padding: 10px 14px; border-radius: 4px; overflow-x: auto; font-size: 11px; line-height: 1.5; }
+  pre code { background: none; color: inherit; padding: 0; }
+  blockquote { border-left: 3px solid #f59e0b; padding: 6px 12px; margin: 10px 0; background: #fffbeb; color: #92400e; }
+  hr { border: none; border-top: 1px dashed #d1d5db; margin: 24px 0; }
+  @media print {
+    body { font-size: 11px; padding: 0; }
+    h2 { break-before: page; }
+    h2:first-of-type { break-before: avoid; }
+    pre { font-size: 9px; }
+  }
+</style>
+</head>
+<body>
+<h1>面试背诵手册：RK3588 多模态视觉理解系统</h1>
+<blockquote>
+<p>项目：YOLOv8n 实时检测 + Qwen2.5-0.5B 端侧 LLM 场景描述，NPU 双模型协同推理
+硬件：Orange Pi 5 Pro (RK3588S, 6 TOPS NPU, 8GB RAM)</p>
+</blockquote>
+<hr />
+<h2>一、YOLO 检测管线</h2>
+<h3>Q1：YOLOv8n 的输入输出是什么？</h3>
+<p><strong>输入</strong>：<code>1 × 3 × 640 × 640</code>（NCHW，RGB，归一化到 0-1）</p>
+<p><strong>输出</strong>：<code>1 × 84 × 8400</code>（单张量，已 DFL 解码）
+- 84 通道：前 4 通道 = cx, cy, w, h（<strong>像素坐标</strong>，不是网格偏移），后 80 通道 = COCO 80 类置信度（已过 sigmoid）
+- 8400 = 80×80 + 40×40 + 20×20（三尺度检测头网格拼接）</p>
+<p><strong>关键差异</strong>：Ultralytics 导出的 ONNX 已在内部完成 DFL 解码 + stride 倍乘，输出直接是像素坐标。旧版 demo 模型输出 9 个张量（未解码），这是 RKNN Toolkit 版本差异导致的。</p>
+<h3>Q2：预处理做了什么？</h3>
+<ol>
+<li><code>imread</code> 读图 → 2. 计算缩放比（保持宽高比，长边 640）→ 3. <code>resize</code> → 4. 灰色填充到 640×640（letterbox）→ 5. BGR→RGB → 6. HWC→CHW → 7. 除以 255 归一化 → 8. <code>malloc</code> 分配连续 float buffer → 9. 传入 NPU</li>
+</ol>
+<h3>Q3：后处理五步结构是什么？</h3>
+<p><strong>cxcywh → xyxy</strong>（中心坐标转角点）→ <strong>找最高分类别</strong>（argmax 80 通道）→ <strong>过滤低分框</strong>（score &gt; threshold）→ <strong>坐标裁剪到图像边界</strong> → <strong>NMS 去重</strong>（IoU 阈值筛选）</p>
+<h3>Q4：NMS（非极大值抑制）的原理？</h3>
+<p>按置信度降序排列所有候选框 → 取最高分的框加入保留集 → 计算它和剩下所有框的 IoU → 删掉 IoU 超过阈值的重叠框 → 重复直到候选集清空。<strong>一句话：同一物体只保留置信度最高的那个框。</strong></p>
+<h3>Q5：为什么 8400 个候选框是三个尺度？</h3>
+<p>YOLOv8 有三个检测头：80×80（浅层，检测小物体，网格最密）、40×40（中层，检测中等物体）、20×20（深层，检测大物体，感受野最大）。三尺度输出拼成一个张量，不需要手动拆开——后处理时 8400 个候选框统一处理。</p>
+<hr />
+<h2>二、LLM 部署概念</h2>
+<h3>Q6：什么是 Token？</h3>
+<p>LLM 不认字，只认数字。<strong>Tokenizer 把文本切成一个个最小单元（token），每个 token 映射为一个整数 ID。</strong> 中文一个字可能是一个 token，英文一个单词可能拆成多个 token。Qwen2.5 的 tokenizer 有约 15 万词表。</p>
+<h3>Q7：什么是 Embedding？</h3>
+<p>把 token ID 映射成一个<strong>高维稠密向量</strong>（比如 896 维）。语义相近的词向量相近。这是 LLM 理解的"词义"。</p>
+<h3>Q8：什么是自回归（Autoregressive）生成？</h3>
+<p>LLM 一次只生成一个 token。流程：输入 "今天的天气" → 输出 "真" → 把 "真" 拼回去变成 "今天的天气真" → 输出 "好" → 循环，直到输出结束符或达到 max_tokens。<strong>每一步的输出变成下一步的输入。</strong></p>
+<h3>Q9：什么是 KV Cache？为什么重要？</h3>
+<p>自回归每步都要对<strong>全部历史 token</strong> 做 Attention。如果没有 KV Cache，第 100 步要重算前 99 步的 Key/Value，计算量 O(n²)。<strong>KV Cache 把每步算好的 K/V 存起来，新步只算新 token 的 Attention</strong>，降到 O(n)。</p>
+<p><strong>对端侧部署的意义</strong>：KV Cache 是 LLM 推理的主要内存占用之一。2048 context × 0.5B 参数 ≈ 几百 MB。</p>
+<h3>Q10：W8A8 量化是什么意思？</h3>
+<p><strong>权重（Weight）8-bit 整数 + 激活值（Activation）8-bit 整数。</strong> 原始 FP16 模型 → RKLLM Toolkit 转换 → 权重和中间结果都用 INT8 存和算。好处：内存减半、NPU 友好（RK3588 NPU 对 INT8 有专用加速单元）。代价：微小精度损失。Qwen2.5-0.5B：FP16 ~1.5GB → W8A8 ~764MB。</p>
+<h3>Q11：0.5B 参数是什么意思？为什么选这个规模？</h3>
+<p>B = Billion = 10 亿。0.5B = 5 亿参数。Qwen2.5-0.5B 是端侧能跑的最小可用模型之一。<strong>选这个规模的原因</strong>：8GB 板端内存能同时装下 YOLO + LLM 两个模型（合计 ~1.5GiB），参数量再大内存不够、速度太慢。0.5B 的 TTFT ~96ms、生成速度 ~41 tok/s，够做场景描述。</p>
+<h3>Q12：什么是 LLM 幻觉（Hallucination）？怎么抑制？</h3>
+<p>LLM 的本质是<strong>自回归续写最像人话的下一个词</strong>，不是在报告事实。输入 "4 person, 1 bus"，训练数据里 "公交车" 后面常跟 "乘客玩手机"——它就顺着续写。temperature=0.1 也压不住。</p>
+<p><strong>解决方案</strong>：Prompt 设计 = <strong>指令 + 数据 + 约束</strong>。"只根据给出的物体列表描述，不要添加列表之外的细节。" 效果：无约束 TTFT 252ms/17.5 tok/s → 加约束 96ms/41.5 tok/s（输出更短更快）。</p>
+<hr />
+<h2>三、RKNN 工具链</h2>
+<h3>Q13：模型转换链路是什么？</h3>
+<pre><code>PyTorch (.pt) → ONNX (.onnx, FP32) → RKNN (.rknn, FP16)
+</code></pre>
+<p>工具：<code>torch.onnx.export</code> → <code>RKNN Toolkit2</code>（<code>rknn.build</code> 或 <code>rknn.export_rknn</code>）</p>
+<h3>Q14：RKNN C API 的 6 个核心函数？</h3>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rknn_init(&amp;ctx, path, ...)</code></td>
+<td>加载模型到 NPU</td>
+</tr>
+<tr>
+<td><code>rknn_query(ctx, IN_OUT_NUM, ...)</code></td>
+<td>查询输入/输出数量</td>
+</tr>
+<tr>
+<td><code>rknn_inputs_set(ctx, 1, inputs)</code></td>
+<td>喂输入数据</td>
+</tr>
+<tr>
+<td><code>rknn_run(ctx, NULL)</code></td>
+<td>触发 NPU 推理</td>
+</tr>
+<tr>
+<td><code>rknn_outputs_get(ctx, 1, outputs)</code></td>
+<td>取输出数据</td>
+</tr>
+<tr>
+<td><code>rknn_destroy(ctx)</code></td>
+<td>释放 NPU 资源</td>
+</tr>
+</tbody>
+</table>
+<p>Python 的 <code>model.run()</code> 内部封装了 set → run → get 三步。</p>
+<h3>Q15：FP16 vs INT8 量化的区别？</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>FP16</th>
+<th>INT8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>精度</td>
+<td>几乎无损</td>
+<td>微小损失</td>
+</tr>
+<tr>
+<td>文件大小</td>
+<td>~ONNX 的 50%</td>
+<td>~ONNX 的 25%</td>
+</tr>
+<tr>
+<td>速度</td>
+<td>快</td>
+<td>更快（NPU 有 INT8 专用加速）</td>
+</tr>
+<tr>
+<td>额外工作</td>
+<td>零（RKNN Toolkit2 默认）</td>
+<td>需要校准数据集 ~100 张</td>
+</tr>
+</tbody>
+</table>
+<p>Week 1 做 FP16 基线，INT8 是后续对比实验。</p>
+<h3>Q16：LLM 推理为什么是回调驱动的？</h3>
+<p><code>rkllm_run()</code> 不是同步返回结果，而是每生成一个 token 调用一次 callback。原因是 LLM 生成是流式的——你不知道要生成多少个 token。<strong>回调模式让上层可以边生成边处理（打印、streaming、计时）。</strong> callback 收到 <code>RKLLM_RUN_FINISH</code> 标志时表示生成结束。</p>
+<h3>Q17：RKLLM 的三个关键生成参数？</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>低值效果</th>
+<th>高值效果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>temperature</td>
+<td>缩放概率分布</td>
+<td>选安全词，保守</td>
+<td>给冷门词机会，多样</td>
+</tr>
+<tr>
+<td>top_k</td>
+<td>候选集大小</td>
+<td>1=贪心，只选最高概率</td>
+<td>50=从 top-50 里采样</td>
+</tr>
+<tr>
+<td>repeat_penalty</td>
+<td>重复惩罚</td>
+<td>允许重复</td>
+<td>抑制已出现过的词</td>
+</tr>
+</tbody>
+</table>
+<p><strong>踩坑</strong>：top_k=1 会压死 temperature 效果——不管 temperature 设多少都只选最高概率那个词。先放开 top_k 再调 temperature。</p>
+<hr />
+<h2>四、C++ 关键概念</h2>
+<h3>Q18：<code>c_str()</code> 的悬空指针问题？</h3>
+<p><code>c_str()</code> 返回 <code>std::string</code> <strong>内部内存</strong>的指针，不是拷贝。之后对 string 的任何修改（<code>+=</code>、<code>append</code>、<code>resize</code>）都可能触发扩容，旧指针指向已释放的内存。<strong>规矩：字符串定稿之后才取 <code>c_str()</code>。</strong></p>
+<h3>Q19：<code>-L</code> 和 <code>-l</code> 的区别？</h3>
+<p><code>-L</code> 指定<strong>库搜索目录</strong>（链接器去哪找 .so 文件），<code>-l</code> 指定<strong>库名</strong>（链接器自动补 <code>lib</code> 前缀和 <code>.so</code> 后缀）。<code>-L/home/lineng -lrknnrt</code> → 链接器在 <code>/home/lineng</code> 找 <code>librknnrt.so</code>。<strong>-L 给目录，-l 给库名，各管各的。</strong></p>
+<h3>Q20：NCHW 内存布局和 anchor-major 的区别？</h3>
+<p>NPU 输出的 <code>(1,84,8400)</code> 是 NCHW（channel-major）布局：<code>[ch0 的 8400 个值] [ch1 的 8400 个值] ... [ch83 的 8400 个值]</code>。但后处理需要 anchor-major：<code>[anchor0 的 84 个值] [anchor1 的 84 个值] ...</code>。<strong>必须做一次转置</strong>，否则读到的数据是乱的（同一个 bug 踩了两次）。</p>
+<h3>Q21：C++ 后处理为什么容易出错？</h3>
+<p>Python 的 <code>boxes[mask]</code> 布尔索引一行搞定，C++ 要 <code>for + if + push_back</code> 手动筛。Python 的 <code>np.maximum</code> 对应 C++ 的 <code>std::max</code>，但语义不是一一对应的。<strong>Python 和 C++ 之间不是语法翻译，是思路翻译。</strong> 编译器救不了逻辑错误——编译通过 ≠ 结果正确。</p>
+<h3>Q22：vector 出参为什么要加 <code>&amp;</code>？</h3>
+<p>C++ 默认传值——函数里改的是副本，调用者拿到的还是空的。加 <code>&amp;</code> 是传引用，改的是原对象。<strong>这是 C++ 初学者最容易无声翻车的地方：编译不报错，程序不崩溃，只是结果为空。</strong></p>
+<hr />
+<h2>五、系统设计</h2>
+<h3>Q23：为什么两个模型可以放在同一个进程里跑？</h3>
+<p>RK3588 NPU 是<strong>分时复用</strong>的，不是分区独占。两个模型同时初始化（各自加载权重到内存），推理时排队串行跑。内存不是瓶颈——YOLO ~50MB + Qwen ~1GB，合计 ~1.5GiB，8GB 总内存剩余 5.5GiB。</p>
+<h3>Q24：NPU 分时方案的设计思路？</h3>
+<p>当前方案（已验证）：<strong>同时 init，串行 run。</strong> 两个模型内存共存、推理排队，无冲突。</p>
+<p>下一步（Week 3）：<strong>时间分片 + 流水线并行</strong>。摄像头帧到达 → YOLO 推理 → 结果立刻送给 LLM → 同时 YOLO 开始处理下一帧。目标是 YOLO 和 LLM 的推理时间重叠，提高吞吐。</p>
+<h3>Q25：双模型管线的完整数据流？</h3>
+<pre><code>摄像头/图片 → 预处理(resize+letterbox+归一化) → NPU(YOLO推理) → 后处理(解码+NMS)
+→ 物体列表(&quot;4 person, 1 bus&quot;) → 构建prompt(指令+数据+约束) → NPU(LLM推理)
+→ 逐token回调 → 场景描述(&quot;一辆公交车上坐着四个人。&quot;)
+</code></pre>
+<h3>Q26：为什么选择 YOLOv8n + Qwen2.5-0.5B 这个组合？</h3>
+<p><strong>YOLOv8n</strong>：最小的 YOLOv8 变体，检测精度够用，推理 ~30ms。<strong>Qwen2.5-0.5B</strong>：端侧能跑的最小可用 LLM，W8A8 压缩后 764MB。两个模型加起来能在 8GB 板端内存共存。这个组合证明了"端侧视觉理解"的可行性下限——两三年后模型更小更快，方案会更成熟。</p>
+<hr />
+<h2>六、性能数据（脱口而出）</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>YOLOv8n 纯 NPU 推理</td>
+<td><strong>~30 ms</strong></td>
+</tr>
+<tr>
+<td>YOLO 端到端（含预处理+后处理）</td>
+<td><strong>~80 ms</strong></td>
+</tr>
+<tr>
+<td>ONNX → RKNN 压缩比</td>
+<td><strong>35%</strong>（12MB → 7.9MB）</td>
+</tr>
+<tr>
+<td>Qwen2.5-0.5B 模型大小（W8A8）</td>
+<td><strong>764 MB</strong></td>
+</tr>
+<tr>
+<td>LLM TTFT（首 token 延迟）</td>
+<td><strong>96 ms</strong>（加约束后）</td>
+</tr>
+<tr>
+<td>LLM 生成速度</td>
+<td><strong>41.5 tok/s</strong>（加约束后）</td>
+</tr>
+<tr>
+<td>双模型内存占用</td>
+<td><strong>~1.5 GiB</strong></td>
+</tr>
+<tr>
+<td>板端剩余内存</td>
+<td><strong>~5.5 GiB</strong></td>
+</tr>
+<tr>
+<td>Qwen 转换耗时（Colima x86）</td>
+<td><strong>~1h43min</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>七、踩坑故事（展示真实经验）</h2>
+<h3>故事 1：输出格式差点让我重写整个后处理</h3>
+<p>demo 模型输出 9 个张量，我自己转换的只输出 1 个。一开始以为是转错了，反复查才发现是 RKNN Toolkit 版本差异——新版默认合并输出。更坑的是坐标格式：我按 demo 代码的 ltrb 网格偏移来写后处理，dump 数据发现值不对，才发现 Ultralytics 导出已经做了 DFL 解码 + stride 倍乘，输出直接是 cxcywh 像素坐标。</p>
+<p><strong>面试官想听</strong>：你遇到矛盾时不是猜，是 dump 实际数据验证。</p>
+<h3>故事 2：c_str() 悬空指针，编译 0 error 照样错</h3>
+<p>代码编译通过、不崩溃、输出也正常——但 LLM 有时候输出乱码。排查发现 <code>c_str()</code> 写在了 prompt 拼接循环之前，之后每次 <code>+=</code> 都可能让 string 扩容搬家。改完只挪了两行代码，但定位花了不少时间。</p>
+<p><strong>面试官想听</strong>：你知道 C++ 的内存模型，不是只会写能编译的代码。</p>
+<h3>故事 3：幻觉实验 — prompt 一句话让速度翻倍</h3>
+<p>无约束时 LLM 输出 "有四个人在一辆公共汽车上，其中一人正在使用手机进行社交互动"——全是编的，TTFT 252ms。加一句 "只根据物体列表描述" 后输出变成 "一辆公交车上坐着四个人。" 零幻觉，TTFT 96ms（快了 2.6 倍）。<strong>小模型的 prompt engineering 不是锦上添花，是刚需。</strong></p>
+<h3>故事 4：g++ 命令断行 — 没报错 ≠ 编译成功</h3>
+<p>终端只回了一句 <code>-O2: command not found</code>，扫一眼没有 "error" 字样就以为过了。结果 <code>ls</code> 发现根本没产物——开头 <code>g++ -</code> 被截掉了，shell 把 <code>-O2</code> 当成命令名执行。<strong>教训：验收标准是产物存在，不是"没看到 error"。</strong></p>
+<hr />
+<h2>八、高频追问</h2>
+<h3>Q：为什么不直接用 ChatGPT API，要在板端跑？</h3>
+<p>端侧推理三大优势：<strong>低延迟</strong>（不经过网络）、<strong>隐私</strong>（数据不出设备）、<strong>离线可用</strong>（不依赖服务器）。安防摄像头、车载、机器人这些场景网络不可靠，端侧是刚需。</p>
+<h3>Q：如果给你更多时间，下一步优化什么？</h3>
+<p><strong>流水线并行</strong>：YOLO 推理和 LLM 推理时间重叠，提高吞吐。<strong>INT8 量化</strong>：进一步压缩模型、加速推理。<strong>零拷贝推理</strong>：用 <code>rknn_create_mem</code> 直接分配 NPU 物理内存，省掉 CPU↔NPU 之间的 memcpy。</p>
+<h3>Q：你为什么做这个项目？</h3>
+<p>边缘 AI 部署是我想深耕的方向——把模型从服务器搬到嵌入式设备上，需要同时懂模型（精度）、懂硬件（NPU 特性）、懂系统（内存/调度）。这个项目覆盖了这三个层面，从 ONNX 转换到 NPU 推理到双模型协同，是我对端侧部署理解的集中体现。</p>
+<hr />
+<h2>九、水下图像增强（Retinex + CLAHE 多路径增强系统）</h2>
+<blockquote>
+<p>时间：2025.5 – 2025.7　　IEEE ICIPCA 2025 录用</p>
+</blockquote>
+<h3>Q1：这个项目解决了什么问题？</h3>
+<p>水下图像退化严重——水对光的吸收和散射导致<strong>颜色失真、对比度低、细节模糊</strong>。单一增强算法（比如只用 CLAHE 拉对比度）对不同退化类型的鲁棒性差。这个项目设计了一套<strong>多路径增强系统</strong>，根据退化类型自动选择合适的增强策略。</p>
+<h3>Q2：Retinex 理论是什么？</h3>
+<p>人眼/相机看到的图像 = <strong>反射分量（reflectance） × 光照分量（illumination）</strong>。Retinex 的核心思想：<strong>从原图中估计并去除光照分量，保留物体本身的反射分量</strong>，从而消除光照不均匀的影响。</p>
+<p>水下场景中，光照分量受水深、水质、光源角度影响剧烈。Retinex 把光照和物体颜色解耦，单独矫正光照，这比直接在 RGB 上调对比度更符合物理规律。</p>
+<h3>Q3：CLAHE 是什么？和普通直方图均衡化有什么区别？</h3>
+<p><strong>CLAHE = Contrast Limited Adaptive Histogram Equalization</strong>（对比度受限的自适应直方图均衡化）。</p>
+<ul>
+<li>普通直方图均衡化（HE）：全局拉伸灰度分布 → 噪声也被放大</li>
+<li>自适应（AHE）：分小块各自均衡 → 块边缘有伪影</li>
+<li><strong>CLAHE</strong>：AHE + <strong>对比度裁剪</strong>（clip limit，把直方图超出阈值的部分均匀分回去）→ 既增强局部对比度又不放大噪声</li>
+</ul>
+<p>水下图像适合 CLAHE 因为退化是空间不均匀的——近处清楚远处模糊，全局均衡化无效。</p>
+<h3>Q4：Retinex 和 CLAHE 在同一个系统里怎么分工？</h3>
+<p>两者互补：
+- <strong>Retinex</strong>：解决<strong>光照不均匀</strong>（去光照分量），恢复颜色真实性
+- <strong>CLAHE</strong>：解决<strong>局部对比度低</strong>（分块均衡），恢复纹理细节</p>
+<p>多路径设计：根据物理退化模型检测退化类型（是散射主导还是吸收主导），不同退化走不同的增强路径——Retinex 为主 + CLAHE 辅助，或 CLAHE 为主 + Retinex 后处理。</p>
+<h3>Q5：物理退化模型里的三种散射分量是什么？</h3>
+<p>水下图像退化不只是"变模糊"，光源→物体→相机之间有三段光路：</p>
+<table>
+<thead>
+<tr>
+<th>分量</th>
+<th>光路</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>直接分量</strong></td>
+<td>物体反射光直接到达相机</td>
+<td>有用信号</td>
+</tr>
+<tr>
+<td><strong>后向散射</strong></td>
+<td>光源打到水中悬浮粒子，散射进相机</td>
+<td>雾状噪声，降低对比度</td>
+</tr>
+<tr>
+<td><strong>前向散射</strong></td>
+<td>物体反射光被粒子散射偏离、再散射进入</td>
+<td>模糊，边缘退化</td>
+</tr>
+</tbody>
+</table>
+<p>三种分量合在一起构建的退化模型比简单的"加雾"更接近真实水下光学。这也是为什么论文能被录——不是纯调参，有物理建模。</p>
+<h3>Q6：多任务 CNN 做什么？</h3>
+<p>输入一张水下图像，CNN 同时做两件事：<strong>判断退化类型</strong>（散射型/吸收型/混合型）+ <strong>估计退化程度</strong>。输出控制后面的增强路径选择和参数设置。多任务设计的好处：两个任务共享浅层特征（纹理、颜色分布），比两个独立模型更高效。</p>
+<h3>Q7：面试官追问"你的贡献是什么？"</h3>
+<p>三个层次回答：
+1. <strong>物理建模</strong>：不是复现别人的增强算法，而是从散射物理模型出发设计了退化框架
+2. <strong>多任务 CNN</strong>：自动检测退化类型，让增强策略自适应（而非手动调参）
+3. <strong>系统验证</strong>：在真实水下图像数据集上验证，有论文发表（IEEE ICIPCA 2025，EI 收录）</p>
+<h3>Q8：为什么水下图像增强不能用常规图像增强方法？</h3>
+<p>三个原因：
+1. <strong>退化非均匀</strong>：不同水深、水质、光照条件下退化机制完全不同。Instagram 滤镜式的全局增强不管用
+2. <strong>颜色通道退化不对称</strong>：红光在水下衰减最快（水吸收红光），蓝绿光穿透更深 → 水下照片偏蓝绿。常规方法不建模通道间的差异
+3. <strong>物理约束</strong>：增强是为了后续任务（目标检测、分类），恢复必须忠实于物体真实颜色，不能"好看但不对"</p>
+<hr />
+<h2>十、微孔光学测量（条纹投影 + 双目视觉）</h2>
+<blockquote>
+<p>时间：2025.3 – 2025.7　　全国大学生光电设计竞赛华北赛区二等奖</p>
+</blockquote>
+<h3>⭐ 保底版（必背，三段话）</h3>
+<blockquote>
+<p>设计了一套条纹投影结合双目视觉的微孔测量装置，可以测量直径小于 0.3 毫米、深径比大于 3 的微孔三维形貌。核心创新是用 Gray 码加互补码双验证解决相位跳变问题。项目拿了全国大学生光电设计竞赛华北赛区二等奖。</p>
+</blockquote>
+<p><strong>如果面试官追问技术细节</strong>（概率很低），直接拉回主场：</p>
+<blockquote>
+<p>"这是本科期间参与的研究项目，现在主攻方向是边缘 AI 部署，如果您感兴趣我可以展开，但我更想聊 RK3588 这个项目。"</p>
+</blockquote>
+<hr />
+<h3>以下为深入版（不需要背，面试前扫一眼即可）</h3>
+<h3>Q1：这个项目测量什么？为什么难？</h3>
+<p>测量直径 <strong>&lt; 0.3mm</strong>、深径比 <strong>&gt; 3</strong> 的微孔三维形貌。难点：孔太小（0.3mm ≈ 3 根头发丝并排）、太深（深径比 &gt;3 → 光进不去出不来）、<strong>常规显微镜只能看到表面，看不到孔内壁</strong>。</p>
+<h3>Q2：条纹投影（Fringe Projection）的原理是什么？</h3>
+<p>投影仪把一组<strong>正弦条纹图案</strong>投到被测物体表面 → 物体表面的三维形状会扭曲条纹（高度不同 → 相位偏移不同）→ 相机拍下变形条纹 → 从相位偏移反推三维高度。</p>
+<p>一句话：<strong>用条纹的变形量编码表面高度</strong>，类似"用影子测凹凸"但精度高得多。</p>
+<h3>Q3：为什么用 Gray 码？什么是相位跳变？</h3>
+<p>条纹投影的问题：相位是周期性的（0→2π→0→2π...），相机记录的相位在 0 到 2π 之间。工件表面高度超过一个周期时，相位直接从 2π 跳回 0——这叫<strong>相位跳变</strong>，导致高度计算错误。</p>
+<p><strong>Gray 码</strong>是一种二进制编码图案，相邻数只变一位。投影多幅 Gray 码图案 → 每个像素得到一个唯一的二进制码 → 告诉相位仪"你现在在第几个周期" → 展开成连续相位（phase unwrapping）。</p>
+<h3>Q4：为什么还要加"互补码"双验证？</h3>
+<p>Gray 码展开有一个经典 bug：<strong>条纹边缘处</strong>（黑白交界），正弦条纹的相位和 Gray 码的二进制边界可能<strong>错开一个像素</strong>，导致展开后的相位跳错一个周期。</p>
+<p>互补码就是 Gray 码整体平移半个周期再投一次，两次结果互相校验——不一致的地方就是边界错误。<strong>Gray 码告诉你第几个周期，互补码确认周期编号没错。</strong></p>
+<h3>Q5：整个测量流程是怎么串起来的？</h3>
+<pre><code>虚拟微孔建模(CAD) → 生成条纹图案 → 投影仪投射到真实微孔
+→ 双目相机采集变形条纹 → Gray码+互补码相位展开
+→ 双目立体匹配(左右相机同名点) → 三角测量求深度 → 三维点云重建
+</code></pre>
+<p>先仿真验证算法正确性，再上硬件跑真实样件。</p>
+<h3>Q6：为什么用双目视觉而不是单目？</h3>
+<p>单目只能从一张图推断深度（靠阴影、纹理等线索），不精确。<strong>双目视觉靠三角测量</strong>：同一个物理点在左右相机成像位置不同（视差），视差 × 基线距离 → 精确深度。对于微孔这种要求微米级精度的场景，双目是必需的。</p>
+<h3>Q7：硬件加速做了什么？</h3>
+<p>Gray 码投影需要多幅图案（一般 7-8 幅），加上互补码就是 14-16 幅。每幅曝光 + 传输 + 处理需要时间。硬件加速：投影仪和相机用硬件触发同步 → 缩短帧间等待 → 测量时间从分钟级降到秒级。</p>
+<h3>Q8：面试官追问"你的贡献是什么？"</h3>
+<ol>
+<li><strong>微孔专用装置设计</strong>：常规条纹投影测的是宏观物体（人脸、零件），你针对 &lt;0.3mm 微孔做了光学系统适配（镜头倍率、投射角度、光照控制）</li>
+<li><strong>Gray 码 + 互补码双验证</strong>：不是照搬书上相位展开方法，加入了互补码作为错误检测机制，解决微孔深径比大导致的投影阴影和边界错误</li>
+<li><strong>全流程覆盖</strong>：从仿真到硬件再到算法，不是"帮师兄跑了一部分"，而是独立完成完整链路</li>
+<li><strong>竞赛验证</strong>：华北赛区二等奖，说明方案经受了同行评审</li>
+</ol>
+<h3>Q9：这个项目和现在做的边缘 AI 有什么关系？</h3>
+<p>看似不相关，但核心能力是相通的：
+- <strong>系统思维</strong>：从物理建模（退化模型 / 条纹投影）→ 算法设计（CNN / 相位展开）→ 硬件实现（光学装置 / Orange Pi）
+- <strong>工程落地</strong>：两个项目都经历了"仿真验证 → 真实数据测试 → 性能评估"的完整工程闭环
+- <strong>竞赛/论文背书</strong>：光电竞赛二等奖 + IEEE 论文，证明你做的东西不是自说自话，有外部认可</p>
+</body>
+</html>

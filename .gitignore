@@ -1,0 +1,20 @@
+# Python 虚拟环境
+.venv/
+
+# 编译产物
+*.o
+*.out
+build/
+
+# 模型文件
+*.rkllm
+*.rknn
+
+# 二进制测试数据
+*.bin
+*.npy
+
+# macOS
+.DS_Store
+__pycache__/
+*.pyc
