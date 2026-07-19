@@ -18,3 +18,9 @@ build/
 .DS_Store
 __pycache__/
 *.pyc
+docs/interview_qa.md
+docs/interview_qa.html
+docs/interview_qa.docx
+src/liu.c
+src/postprocess_rewrite.cpp
+src/rknn_exercise.c
