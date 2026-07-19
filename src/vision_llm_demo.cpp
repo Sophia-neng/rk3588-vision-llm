@@ -10,6 +10,7 @@
 #include "rkllm.h"
 #include <fstream>
 #include <csignal>
+#include <chrono>
 using namespace std;
 
 using namespace std;
@@ -386,7 +387,9 @@ int main(int argc, char **argv)
 	printf("rknn_inputs_set OK (fed %d bytes)\n", INPUT_SIZE);
 
 	// ====== 4. 触发 NPU 推理 ======
+	auto start1 = std::chrono::high_resolution_clock::now();
 	ret = rknn_run(ctx, NULL);
+	auto end1 = std::chrono::high_resolution_clock::now();
 	if (ret < 0)
 	{
 		printf("rknn_run failed! ret=%d\n", ret);
@@ -454,11 +457,17 @@ int main(int argc, char **argv)
 	rkllm_input.prompt_input = (char *)prompt.c_str();
 	t0 = std::chrono::steady_clock::now();
 	token_count = 0;
+	auto start2 = std::chrono::high_resolution_clock::now();
 	rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+	auto end2 = std::chrono::high_resolution_clock::now();
 
+	auto yolo_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end1 - start1).count();
+	auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end2 - start2).count();
 	auto ttft = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 	auto decode = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
 	auto tokens_per_s = token_count / (decode / 1000.0);
+	std::cout << "yolo time: " << yolo_ms << "ms" << std::endl;
+	std::cout << "llm time: " << llm_ms << "ms" << std::endl;
 	std::cout << "tokens_per_s: " << tokens_per_s << std::endl;
 	std::cout << "decode: " << decode / 1000.0 << "s" << std::endl;
 	std::cout << "ttft time: " << ttft / 1000.0 << "s" << std::endl;
