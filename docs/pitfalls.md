@@ -65,14 +65,6 @@
 
 ---
 
-## 5. 自己转换模型推理验证通过
-
-**日期**：2026-07-11
-
-**过程**：自己转换的 `yolov8n.rknn`（FP16，7.9 MB）首次在板端推理，输入 `demo.png`，检出 6 个目标（car×3, bus×1, truck×1），坐标合理。与 demo 模型的耗时差异（~30ms vs 79ms）来自单次冷推理 vs 多次均值，非模型问题。
-
-**意义**：验证了完整的 ONNX→RKNN 转换链路正确，后续可以脱离 demo 模型独立开发。
-
 ---
 
 ## 6. C++ 后处理重写：编译通过 ≠ 逻辑正确
@@ -143,31 +135,6 @@
 **教训**：同一个 bug 在 Python 和 C++ 两端各踩一次 = 概念没彻底消化。现在彻底懂了。NPU 输出的 `(1,84,8400)` 不是 `[anchor][channel]` 而是 `[channel][anchor]`。
 
 ---
-
-## 10. YOLO C++ 完整管线编译记录
-
-**日期**：2026-07-16
-
-**编译环境**：Orange Pi 5 Pro (aarch64), g++ 11, OpenCV 4.5, RKNN Runtime 2.3.2
-
-**编译命令**：
-```bash
-g++ -std=c++17 -O2 yolo_pipeline.cpp -o yolo_pipeline \
-    -I/home/lineng -I/usr/include/opencv4 \
-    -L/usr/lib/aarch64-linux-gnu \
-    -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_highgui \
-    -lrknnrt
-```
-
-**文件结构**：
-```
-yolo_pipeline.cpp
-├── COCO_CLASSES[80]     — 标签名映射
-├── nms()                — 非极大值抑制
-├── postprocess()        — decode boxes + 分类 + 过滤
-├── preprocess()         — imread→letterbox→BGR2RGB→malloc 输出 640×640×3 buffer
-└── main()               — 串联预处理→推理→转置→后处理→打印结果
-```
 
 ---
 
