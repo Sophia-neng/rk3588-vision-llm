@@ -50,10 +50,22 @@ g++ -std=c++17 src/vision_llm_demo.cpp -o vision_llm_demo \
   -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_highgui \
   -lrknnrt -lrkllmrt
 
-# 3. 运行
+# 3. 运行（必须参数）
 export LD_LIBRARY_PATH=/path/to/libs:$LD_LIBRARY_PATH
-./vision_llm_demo /path/to/model.rkllm 128 2048 \
-  /path/to/yolov8n.rknn /path/to/image.jpg
+./vision_llm_demo \
+  --llm   /path/to/model.rkllm \
+  --model /path/to/yolov8n.rknn \
+  --image /path/to/image.jpg
+
+# 完整参数
+./vision_llm_demo \
+  --llm     /path/to/model.rkllm \
+  --model   /path/to/yolov8n.rknn \
+  --image   /path/to/image.jpg \
+  --tokens  128 \
+  --context 2048 \
+  --conf    0.25 \
+  --iou     0.45
 ```
 
 ## 性能速查

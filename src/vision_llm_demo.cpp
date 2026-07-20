@@ -2,482 +2,482 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <opencv2/opencv.hpp>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "rknn_api.h"
-#include "rkllm.h"
-#include <fstream>
+#include <cstring>
+#include <cstdlib>
 #include <csignal>
 #include <chrono>
-using namespace std;
+#include <fstream>
+#include <opencv2/opencv.hpp>
+#include "rknn_api.h"
+#include "rkllm.h"
 
 using namespace std;
+
+// ====== 全局状态（callback 需要访问） ======
 LLMHandle llmHandle = nullptr;
 int token_count = 0;
-auto t0 = std::chrono::steady_clock::now();
+auto t0 = chrono::steady_clock::now();
 auto t1 = t0;
 auto t2 = t0;
 
+// ====== COCO 类别名 ======
+const char *COCO_CLASSES[] = {
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
+    "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
+    "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush"};
+
+// ====== 预处理：读图 → letterbox → 640×640 RGB ======
 unsigned char *preprocess(const char *image_path, int &orig_w, int &orig_h)
 {
-	const int MODEL_W = 640;
-	const int MODEL_H = 640;
-	const int CHANNELS = 3;
+    const int MODEL_W = 640;
+    const int MODEL_H = 640;
+    const int CHANNELS = 3;
 
-	// 1. 读图（OpenCV 默认 BGR 顺序，UINT8）
-	cv::Mat img = cv::imread(image_path);
-	if (img.empty())
-	{
-		printf("Failed to read image: %s\n", image_path);
-		return nullptr;
-	}
+    cv::Mat img = cv::imread(image_path);
+    if (img.empty())
+    {
+        cerr << "Error: failed to read image " << image_path << endl;
+        return nullptr;
+    }
 
-	// 2. 记录原始尺寸（后处理还原坐标用）
-	orig_w = img.cols;
-	orig_h = img.rows;
+    orig_w = img.cols;
+    orig_h = img.rows;
 
-	// 3. 算 letterbox 缩放比例
-	//    scale = 长边缩到 640，短边等比缩放
-	float scale = std::min(
-		(float)MODEL_W / orig_w,
-		(float)MODEL_H / orig_h);
-	int new_w = (int)(orig_w * scale);
-	int new_h = (int)(orig_h * scale);
+    // letterbox：长边缩到 640，短边等比缩放
+    float scale = min((float)MODEL_W / orig_w, (float)MODEL_H / orig_h);
+    int new_w = (int)(orig_w * scale);
+    int new_h = (int)(orig_h * scale);
 
-	// 4. Resize：保持宽高比缩放到 new_w × new_h
-	cv::Mat resized;
-	cv::resize(img, resized, cv::Size(new_w, new_h));
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
 
-	// 5. 算灰边宽度（整除不干净时，右边/下边多补一个像素）
-	int dw = MODEL_W - new_w; // 总共有多少空余宽度
-	int dh = MODEL_H - new_h; // 总共有多少空余高度
-	int top = dh / 2;		  // 上方灰边
-	int bottom = dh - top;	  // 下方灰边（可能比 top 多 1px）
-	int left = dw / 2;		  // 左方灰边
-	int right = dw - left;	  // 右方灰边
+    // 补灰边（114 = YOLO 训练填充色）
+    int dw = MODEL_W - new_w;
+    int dh = MODEL_H - new_h;
+    int top = dh / 2;
+    int bottom = dh - top;
+    int left = dw / 2;
+    int right = dw - left;
 
-	// 6. 补灰边（114 是 YOLO 训练时的填充色）
-	cv::Mat padded;
-	cv::copyMakeBorder(resized, padded,
-					   top, bottom, left, right,
-					   cv::BORDER_CONSTANT,
-					   cv::Scalar(114, 114, 114));
+    cv::Mat padded;
+    cv::copyMakeBorder(resized, padded,
+                       top, bottom, left, right,
+                       cv::BORDER_CONSTANT,
+                       cv::Scalar(114, 114, 114));
 
-	// 现在 padded 是 640×640 BGR
+    // BGR → RGB
+    cv::Mat rgb;
+    cv::cvtColor(padded, rgb, cv::COLOR_BGR2RGB);
 
-	// 7. BGR → RGB（OpenCV 默认 BGR，YOLO 训练用 RGB）
-	cv::Mat rgb;
-	cv::cvtColor(padded, rgb, cv::COLOR_BGR2RGB);
+    unsigned char *output = (unsigned char *)malloc(MODEL_W * MODEL_H * CHANNELS);
+    if (!output)
+    {
+        cerr << "Error: malloc failed in preprocess" << endl;
+        return nullptr;
+    }
 
-	// 8. 分配输出 buffer（调用方负责 free）
-	//    大小 = 640 × 640 × 3
-	unsigned char *output = (unsigned char *)malloc(MODEL_W * MODEL_H * CHANNELS);
-	if (!output)
-	{
-		printf("malloc failed!\n");
-		return nullptr;
-	}
+    // 逐行拷贝：OpenCV Mat 行间可能有 padding，必须保证连续内存
+    for (int r = 0; r < MODEL_H; r++)
+    {
+        memcpy(output + r * MODEL_W * CHANNELS,
+               rgb.ptr<unsigned char>(r),
+               MODEL_W * CHANNELS);
+    }
 
-	// 9. 拷贝到连续内存（OpenCV 的 Mat 可能每行有 padding 字节，
-	//    必须用 memcpy 做逐行复制保证连续性）
-	for (int r = 0; r < MODEL_H; r++)
-	{
-		memcpy(
-			output + r * MODEL_W * CHANNELS, // 目的：第 r 行起始地址
-			rgb.ptr<unsigned char>(r),		 // 源：  第 r 行起始地址
-			MODEL_W * CHANNELS				 // 每行字节数
-		);
-	}
-
-	return output;
+    return output;
 }
 
-std::vector<int> nms(
-	const std::vector<std::vector<float>> &boxes,
-	const std::vector<float> &scores,
-	float iou_thres = 0.45)
+// ====== NMS（非极大值抑制） ======
+vector<int> nms(const vector<vector<float>> &boxes,
+                const vector<float> &scores,
+                float iou_thres = 0.45)
 {
-	int N = boxes.size();
-	std::vector<float> x1(N), y1(N), x2(N), y2(N);
-	for (int i = 0; i < N; i++)
-	{
-		x1[i] = boxes[i][0];
-		y1[i] = boxes[i][1];
-		x2[i] = boxes[i][2];
-		y2[i] = boxes[i][3];
-	}
-	std::vector<float> areas(N);
-	for (int i = 0; i < N; i++)
-	{
-		areas[i] = (x2[i] - x1[i]) * (y2[i] - y1[i]);
-	}
-	std::vector<int> order(N);
-	for (int i = 0; i < N; i++)
-	{
-		order[i] = i;
-	}
-	std::sort(order.begin(), order.end(), [&scores](int a, int b)
-			  { return scores[a] > scores[b]; });
-	std::vector<int> keep;
-	while (order.size() > 0)
-	{
-		int i = order[0];
-		keep.push_back(i);
-		if (order.size() == 1)
-		{
-			break;
-		}
-		std::vector<int> new_order;
-		for (int k = 1; k < order.size(); k++)
-		{
-			int j = order[k];
-			float xx1 = std::max(x1[i], x1[j]);
-			float yy1 = std::max(y1[i], y1[j]);
-			float xx2 = std::min(x2[i], x2[j]);
-			float yy2 = std::min(y2[i], y2[j]);
-			float w = max(0.0f, xx2 - xx1);
-			float h = max(0.0f, yy2 - yy1);
-			float inter = w * h;
-			float iou_val = inter / (areas[i] + areas[j] - inter);
-			if (iou_val <= iou_thres)
-			{
-				new_order.push_back(j);
-			}
-		}
-		order = new_order;
-	}
-	return keep;
+    int N = boxes.size();
+    vector<float> x1(N), y1(N), x2(N), y2(N), areas(N);
+    for (int i = 0; i < N; i++)
+    {
+        x1[i] = boxes[i][0];
+        y1[i] = boxes[i][1];
+        x2[i] = boxes[i][2];
+        y2[i] = boxes[i][3];
+        areas[i] = (x2[i] - x1[i]) * (y2[i] - y1[i]);
+    }
+
+    vector<int> order(N);
+    for (int i = 0; i < N; i++)
+        order[i] = i;
+    sort(order.begin(), order.end(), [&scores](int a, int b)
+         { return scores[a] > scores[b]; });
+
+    vector<int> keep;
+    while (order.size() > 0)
+    {
+        int i = order[0];
+        keep.push_back(i);
+        if (order.size() == 1)
+            break;
+
+        vector<int> new_order;
+        for (size_t k = 1; k < order.size(); k++)
+        {
+            int j = order[k];
+            float xx1 = max(x1[i], x1[j]);
+            float yy1 = max(y1[i], y1[j]);
+            float xx2 = min(x2[i], x2[j]);
+            float yy2 = min(y2[i], y2[j]);
+            float w = max(0.0f, xx2 - xx1);
+            float h = max(0.0f, yy2 - yy1);
+            float iou_val = (w * h) / (areas[i] + areas[j] - w * h);
+            if (iou_val <= iou_thres)
+                new_order.push_back(j);
+        }
+        order = new_order;
+    }
+    return keep;
 }
 
-void postprocess(
-	const float *output,
-	std::vector<std::vector<float>> &boxes_out,
-	std::vector<int> &class_out,
-	std::vector<float> &score_out,
-	float conf_thres = 0.25,
-	float iou_thres = 0.45)
+// ====== YOLO 后处理：decode + 置信度过滤 + NMS ======
+void postprocess(const float *output,
+                 vector<vector<float>> &boxes_out,
+                 vector<int> &class_out,
+                 vector<float> &score_out,
+                 float conf_thres = 0.25,
+                 float iou_thres = 0.45)
 {
-	const int NUM_ANCHORS = 8400;
-	const int NUM_FEATURES = 84;
-	vector<vector<float>> all_boxes(NUM_ANCHORS, vector<float>(4));
-	vector<float> all_scores(NUM_ANCHORS);
-	vector<int> all_classes(NUM_ANCHORS);
-	for (int i = 0; i < NUM_ANCHORS; i++)
-	{
-		int offset = i * NUM_FEATURES;
-		float cx = output[offset + 0];
-		float cy = output[offset + 1];
-		float bw = output[offset + 2];
-		float bh = output[offset + 3];
+    const int NUM_ANCHORS = 8400;
+    const int NUM_FEATURES = 84;
 
-		all_boxes[i][0] = cx - bw / 2.0f;
-		all_boxes[i][1] = cy - bh / 2.0f;
-		all_boxes[i][2] = cx + bw / 2.0f;
-		all_boxes[i][3] = cy + bh / 2.0f;
+    vector<vector<float>> all_boxes(NUM_ANCHORS, vector<float>(4));
+    vector<float> all_scores(NUM_ANCHORS);
+    vector<int> all_classes(NUM_ANCHORS);
 
-		float max_score = 0.0f;
-		int best_class = 0;
-		for (int c = 0; c < 80; c++)
-		{
-			float score = output[offset + 4 + c];
-			if (score > max_score)
-			{
-				max_score = score;
-				best_class = c;
-			}
-		}
-		all_scores[i] = max_score;
-		all_classes[i] = best_class;
-	}
-	vector<vector<float>> filtered_boxes;
-	vector<float> filtered_scores;
-	vector<int> filtered_classes;
-	for (int i = 0; i < NUM_ANCHORS; i++)
-	{
-		if (all_scores[i] > conf_thres)
-		{
-			filtered_boxes.push_back(all_boxes[i]);
-			filtered_scores.push_back(all_scores[i]);
-			filtered_classes.push_back(all_classes[i]);
-		}
-	}
-	float img_w = 640.0;
-	float img_h = 640.0;
-	for (auto &box : filtered_boxes)
-	{
-		box[0] = std::clamp(box[0], 0.0f, img_w);
-		box[1] = std::clamp(box[1], 0.0f, img_h);
-		box[2] = std::clamp(box[2], 0.0f, img_w);
-		box[3] = std::clamp(box[3], 0.0f, img_h);
-	}
-	vector<int> keep = nms(filtered_boxes, filtered_scores, iou_thres);
+    for (int i = 0; i < NUM_ANCHORS; i++)
+    {
+        int offset = i * NUM_FEATURES;
+        float cx = output[offset + 0];
+        float cy = output[offset + 1];
+        float bw = output[offset + 2];
+        float bh = output[offset + 3];
 
-	for (auto v : keep)
-	{
-		boxes_out.push_back(filtered_boxes[v]);
-		class_out.push_back(filtered_classes[v]);
-		score_out.push_back(filtered_scores[v]);
-	}
+        all_boxes[i][0] = cx - bw / 2.0f;
+        all_boxes[i][1] = cy - bh / 2.0f;
+        all_boxes[i][2] = cx + bw / 2.0f;
+        all_boxes[i][3] = cy + bh / 2.0f;
+
+        // 取 80 类中 score 最高的
+        float max_score = 0.0f;
+        int best_class = 0;
+        for (int c = 0; c < 80; c++)
+        {
+            float score = output[offset + 4 + c];
+            if (score > max_score)
+            {
+                max_score = score;
+                best_class = c;
+            }
+        }
+        all_scores[i] = max_score;
+        all_classes[i] = best_class;
+    }
+
+    // 置信度过滤
+    vector<vector<float>> filtered_boxes;
+    vector<float> filtered_scores;
+    vector<int> filtered_classes;
+    for (int i = 0; i < NUM_ANCHORS; i++)
+    {
+        if (all_scores[i] > conf_thres)
+        {
+            filtered_boxes.push_back(all_boxes[i]);
+            filtered_scores.push_back(all_scores[i]);
+            filtered_classes.push_back(all_classes[i]);
+        }
+    }
+
+    // clamp 到图像边界
+    for (auto &box : filtered_boxes)
+    {
+        box[0] = clamp(box[0], 0.0f, 640.0f);
+        box[1] = clamp(box[1], 0.0f, 640.0f);
+        box[2] = clamp(box[2], 0.0f, 640.0f);
+        box[3] = clamp(box[3], 0.0f, 640.0f);
+    }
+
+    // NMS
+    vector<int> keep = nms(filtered_boxes, filtered_scores, iou_thres);
+    for (auto v : keep)
+    {
+        boxes_out.push_back(filtered_boxes[v]);
+        class_out.push_back(filtered_classes[v]);
+        score_out.push_back(filtered_scores[v]);
+    }
 }
 
-const char *COCO_CLASSES[] = {
-	"person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-	"traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
-	"dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
-	"umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
-	"kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
-	"bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-	"sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
-	"chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
-	"mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-	"refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-	"toothbrush"};
-
+// ====== LLM 流式输出回调 ======
 int callback(RKLLMResult *result, void *userdata, LLMCallState state)
 {
-	if (state == RKLLM_RUN_FINISH)
-	{
-		t2 = std::chrono::steady_clock::now();
-		printf("\n");
-	}
-	else if (state == RKLLM_RUN_ERROR)
-	{
-		printf("\\run error\n");
-	}
-	else if (state == RKLLM_RUN_NORMAL)
-	{
-		token_count++;
-		if (token_count == 1)
-		{
-			t1 = std::chrono::steady_clock::now();
-		}
-		/* ================================================================================================================
-		若使用GET_LAST_HIDDEN_LAYER功能,callback接口会回传内存指针:last_hidden_layer,token数量:num_tokens与隐藏层大小:embd_size
-		通过这三个参数可以取得last_hidden_layer中的数据
-		注:需要在当前callback中获取,若未及时获取,下一次callback会将该指针释放
-		===============================================================================================================*/
-		if (result->last_hidden_layer.embd_size != 0 && result->last_hidden_layer.num_tokens != 0)
-		{
-			int data_size = result->last_hidden_layer.embd_size * result->last_hidden_layer.num_tokens * sizeof(float);
-			printf("\ndata_size:%d", data_size);
-			std::ofstream outFile("last_hidden_layer.bin", std::ios::binary);
-			if (outFile.is_open())
-			{
-				outFile.write(reinterpret_cast<const char *>(result->last_hidden_layer.hidden_states), data_size);
-				outFile.close();
-				std::cout << "Data saved to output.bin successfully!" << std::endl;
-			}
-			else
-			{
-				std::cerr << "Failed to open the file for writing!" << std::endl;
-			}
-		}
-		printf("%s", result->text);
-	}
-	return 0;
+    if (state == RKLLM_RUN_FINISH)
+    {
+        t2 = chrono::steady_clock::now();
+        cout << endl;
+    }
+    else if (state == RKLLM_RUN_ERROR)
+    {
+        cerr << "Error: LLM run error" << endl;
+    }
+    else if (state == RKLLM_RUN_NORMAL)
+    {
+        token_count++;
+        if (token_count == 1)
+            t1 = chrono::steady_clock::now();
+
+        cout << result->text << flush;
+    }
+    return 0;
 }
+
 void exit_handler(int signal)
 {
-	if (llmHandle != nullptr)
-	{
-		{
-			cout << "程序即将退出" << endl;
-			LLMHandle _tmp = llmHandle;
-			llmHandle = nullptr;
-			rkllm_destroy(_tmp);
-		}
-	}
-	exit(signal);
+    if (llmHandle != nullptr)
+    {
+        cout << "Exiting..." << endl;
+        LLMHandle _tmp = llmHandle;
+        llmHandle = nullptr;
+        rkllm_destroy(_tmp);
+    }
+    exit(signal);
 }
 
+// ====== main ======
 int main(int argc, char **argv)
 {
-	if (argc < 6)
-	{
-		printf("Usage: %s<qwen.rkllm> <max_new_tokens> <max_context_len> <model.rknn> <image.jpg>\n", argv[0]);
-		printf("  image: any JPEG/PNG image\n");
-		return 1;
-	}
+    // ----- 参数解析 -----
+    const char *llm_path = nullptr;
+    const char *model_path = nullptr;
+    const char *image_path = nullptr;
+    int max_tokens = 128;
+    int max_context = 2048;
+    float conf_thres = 0.25;
+    float iou_thres = 0.45;
 
-	char *model_path = argv[4];
-	char *input_path = argv[5];
+    for (int i = 1; i < argc; i++)
+    {
+        if (argv[i][0] == '-' && i + 1 >= argc)
+        {
+            cerr << "Error: " << argv[i] << " requires an argument" << endl;
+            return 1;
+        }
+        if (strcmp(argv[i], "--llm") == 0)    { llm_path   = argv[i + 1]; i++; }
+        if (strcmp(argv[i], "--model") == 0)  { model_path = argv[i + 1]; i++; }
+        if (strcmp(argv[i], "--image") == 0)  { image_path = argv[i + 1]; i++; }
+        if (strcmp(argv[i], "--tokens") == 0) { max_tokens = atoi(argv[i + 1]); i++; }
+        if (strcmp(argv[i], "--context") == 0){ max_context = atoi(argv[i + 1]); i++; }
+        if (strcmp(argv[i], "--conf") == 0)   { conf_thres = atof(argv[i + 1]); i++; }
+        if (strcmp(argv[i], "--iou") == 0)    { iou_thres  = atof(argv[i + 1]); i++; }
+    }
 
-	// ====== 1. 初始化: 加载模型到 NPU ======
-	rknn_context ctx = 0;
-	int ret = rknn_init(&ctx, (void *)model_path, 0, 0, NULL);
-	if (ret < 0)
-	{
-		printf("rknn_init failed! ret=%d\n", ret);
-		return -1;
-	}
-	printf("rknn_init OK\n");
+    if (!llm_path || !model_path || !image_path)
+    {
+        cerr << "Usage: " << argv[0]
+             << " --llm <path> --model <path> --image <path>"
+             << " [--tokens 128] [--context 2048] [--conf 0.25] [--iou 0.45]"
+             << endl;
+        return 1;
+    }
 
-	// 加载llm模型
-	signal(SIGINT, exit_handler);
-	printf("rkllm init start\n");
+    // ====== 1. 加载 YOLO 模型 ======
+    rknn_context ctx = 0;
+    int ret = rknn_init(&ctx, (void *)model_path, 0, 0, NULL);
+    if (ret < 0)
+    {
+        cerr << "Error: rknn_init failed, ret=" << ret << endl;
+        return 1;
+    }
 
-	// 设置参数及初始化
-	RKLLMParam param = rkllm_createDefaultParam();
-	param.model_path = argv[1];
+    // ====== 2. 加载 LLM 模型 ======
+    signal(SIGINT, exit_handler);
 
-	// 设置采样参数
-	param.top_k = 1;
-	param.top_p = 0.95;
-	param.temperature = 0.1;
-	param.repeat_penalty = 1.1;
-	param.frequency_penalty = 0.0;
-	param.presence_penalty = 0.0;
+    RKLLMParam param = rkllm_createDefaultParam();
+    param.model_path = llm_path;
+    param.top_k = 1;
+    param.top_p = 0.95;
+    param.temperature = 0.1;
+    param.repeat_penalty = 1.1;
+    param.frequency_penalty = 0.0;
+    param.presence_penalty = 0.0;
+    param.max_new_tokens = max_tokens;
+    param.max_context_len = max_context;
+    param.skip_special_token = true;
+    param.extend_param.base_domain_id = 0;
+    param.extend_param.embed_flash = 1;
 
-	param.max_new_tokens = std::atoi(argv[2]);
-	param.max_context_len = std::atoi(argv[3]);
-	param.skip_special_token = true;
-	param.extend_param.base_domain_id = 0;
-	param.extend_param.embed_flash = 1;
+    RKLLMCallback rkllm_callback = {};
+    rkllm_callback.result_callback = callback;
+    ret = rkllm_init(&llmHandle, &param, &rkllm_callback);
+    if (ret != 0)
+    {
+        cerr << "Error: rkllm_init failed, ret=" << ret << endl;
+        rknn_destroy(ctx);
+        return 1;
+    }
 
-	RKLLMCallback rkllm_callback = {};
-	rkllm_callback.result_callback = callback;
-	ret = rkllm_init(&llmHandle, &param, &rkllm_callback);
-	if (ret == 0)
-	{
-		printf("rkllm init success\n");
-	}
-	else
-	{
-		printf("rkllm init failed\n");
-		exit_handler(-1);
-	}
-	// ====== 2. 查询模型输入/输出信息 ======
-	rknn_input_output_num io_num;
-	ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
-	if (ret < 0)
-	{
-		printf("rknn_query failed! ret=%d\n", ret);
-		return -1;
-	}
-	printf("rknn_query: n_input=%d, n_output=%d\n",
-		   io_num.n_input, io_num.n_output);
+    // ====== 3. 查询 YOLO 输入输出信息 ======
+    rknn_input_output_num io_num;
+    ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
+    if (ret < 0)
+    {
+        cerr << "Error: rknn_query failed, ret=" << ret << endl;
+        rkllm_destroy(llmHandle);
+        rknn_destroy(ctx);
+        return 1;
+    }
+    cout << "[YOLO] n_input=" << io_num.n_input
+         << ", n_output=" << io_num.n_output << endl;
 
-	// ====== 3. 预处理，读图+letterbox->640*640RGB ======
-	const int INPUT_SIZE = 640 * 640 * 3;
-	int orig_w, orig_h;
-	unsigned char *input_data = preprocess(input_path, orig_w, orig_h);
-	if (!input_data)
-	{
-		printf("preprocess failed!\n");
-		return -1;
-	}
+    // ====== 4. 预处理 ======
+    const int INPUT_SIZE = 640 * 640 * 3;
+    int orig_w, orig_h;
+    unsigned char *input_data = preprocess(image_path, orig_w, orig_h);
+    if (!input_data)
+    {
+        cerr << "Error: preprocess failed" << endl;
+        rkllm_destroy(llmHandle);
+        rknn_destroy(ctx);
+        return 1;
+    }
 
-	// 设置输入描述
-	rknn_input inputs[1];
-	memset(inputs, 0, sizeof(inputs));
-	inputs[0].index = 0;
-	inputs[0].type = RKNN_TENSOR_UINT8; // 数据类型
-	inputs[0].fmt = RKNN_TENSOR_NHWC;	// 布局: HWC
-	inputs[0].size = INPUT_SIZE;
-	inputs[0].buf = input_data;
+    // ====== 5. 设置输入 + YOLO 推理 ======
+    rknn_input inputs[1];
+    memset(inputs, 0, sizeof(inputs));
+    inputs[0].index = 0;
+    inputs[0].type = RKNN_TENSOR_UINT8;
+    inputs[0].fmt = RKNN_TENSOR_NHWC;
+    inputs[0].size = INPUT_SIZE;
+    inputs[0].buf = input_data;
 
-	ret = rknn_inputs_set(ctx, io_num.n_input, inputs);
-	if (ret < 0)
-	{
-		printf("rknn_inputs_set failed! ret=%d\n", ret);
-		return -1;
-	}
-	printf("rknn_inputs_set OK (fed %d bytes)\n", INPUT_SIZE);
+    ret = rknn_inputs_set(ctx, io_num.n_input, inputs);
+    if (ret < 0)
+    {
+        cerr << "Error: rknn_inputs_set failed, ret=" << ret << endl;
+        free(input_data);
+        rkllm_destroy(llmHandle);
+        rknn_destroy(ctx);
+        return 1;
+    }
 
-	// ====== 4. 触发 NPU 推理 ======
-	auto start1 = std::chrono::high_resolution_clock::now();
-	ret = rknn_run(ctx, NULL);
-	auto end1 = std::chrono::high_resolution_clock::now();
-	if (ret < 0)
-	{
-		printf("rknn_run failed! ret=%d\n", ret);
-		return -1;
-	}
-	printf("rknn_run OK\n");
+    auto yolo_start = chrono::high_resolution_clock::now();
+    ret = rknn_run(ctx, NULL);
+    auto yolo_end = chrono::high_resolution_clock::now();
+    if (ret < 0)
+    {
+        cerr << "Error: rknn_run failed, ret=" << ret << endl;
+        free(input_data);
+        rkllm_destroy(llmHandle);
+        rknn_destroy(ctx);
+        return 1;
+    }
 
-	// ====== 5. 获取输出 ======
-	rknn_output outputs[1];
-	memset(outputs, 0, sizeof(outputs));
-	outputs[0].want_float = 1; // 输出转 float32
+    // ====== 6. 获取输出 + 后处理 ======
+    rknn_output outputs[1];
+    memset(outputs, 0, sizeof(outputs));
+    outputs[0].want_float = 1;
 
-	ret = rknn_outputs_get(ctx, 1, outputs, NULL);
-	if (ret < 0)
-	{
-		printf("rknn_outputs_get failed! ret=%d\n", ret);
-		return -1;
-	}
-	printf("rknn_outputs_get OK, output size=%d bytes\n",
-		   outputs[0].size);
+    ret = rknn_outputs_get(ctx, 1, outputs, NULL);
+    if (ret < 0)
+    {
+        cerr << "Error: rknn_outputs_get failed, ret=" << ret << endl;
+        free(input_data);
+        rkllm_destroy(llmHandle);
+        rknn_destroy(ctx);
+        return 1;
+    }
 
-	// outputs[0].buf 现在指向 (1,84,8400) float32 数据
-	float *output_data = (float *)outputs[0].buf;
-	int NUM_ANCHORS = 8400;
-	int NUM_FEATURES = 84;
-	float *transposed = (float *)malloc(NUM_ANCHORS * NUM_FEATURES * sizeof(float));
-	for (int i = 0; i < NUM_ANCHORS; i++)
-	{ // 遍历每个 anchor
-		for (int c = 0; c < NUM_FEATURES; c++)
-		{ // 遍历 84 个通道
-			transposed[i * NUM_FEATURES + c] = output_data[c * NUM_ANCHORS + i];
-		}
-	}
-	vector<std::vector<float>> boxes;
-	vector<float> scores;
-	vector<int> classes;
-	postprocess(transposed, boxes, classes, scores);
-	free(transposed);
-	printf("Detected %zu objects:\n", boxes.size());
-	for (size_t i = 0; i < boxes.size(); i++)
-	{
-		printf("%s, score: %.2f\n", COCO_CLASSES[classes[i]], scores[i]);
-	}
-	int class_count[80] = {0};
-	for (size_t i = 0; i < boxes.size(); i++)
-	{
-		class_count[classes[i]]++;
-	}
-	RKLLMInput rkllm_input;
-	memset(&rkllm_input, 0, sizeof(RKLLMInput));
-	RKLLMInferParam rkllm_infer_params;
-	memset(&rkllm_infer_params, 0, sizeof(RKLLMInferParam)); // 将所有内容初始化为 0
-	std::string prompt = ("请用一句话描述这个场景,只根据给出的物体列表描述，不要添加列表之外的细节。图片中检测到：");
-	for (int j = 0; j < 80; j++)
-	{
-		if (class_count[j] > 0)
-		{
-			prompt += (std::to_string(class_count[j]));
-			prompt += ("个");
-			prompt += (COCO_CLASSES[j]);
-			prompt += (",");
-		}
-	}
-	rkllm_input.input_type = RKLLM_INPUT_PROMPT;
-	rkllm_input.prompt_input = (char *)prompt.c_str();
-	t0 = std::chrono::steady_clock::now();
-	token_count = 0;
-	auto start2 = std::chrono::high_resolution_clock::now();
-	rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
-	auto end2 = std::chrono::high_resolution_clock::now();
+    float *output_data = (float *)outputs[0].buf;
+    const int NUM_ANCHORS = 8400;
+    const int NUM_FEATURES = 84;
 
-	auto yolo_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end1 - start1).count();
-	auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end2 - start2).count();
-	auto ttft = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-	auto decode = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-	auto tokens_per_s = token_count / (decode / 1000.0);
-	std::cout << "yolo time: " << yolo_ms << "ms" << std::endl;
-	std::cout << "llm time: " << llm_ms << "ms" << std::endl;
-	std::cout << "tokens_per_s: " << tokens_per_s << std::endl;
-	std::cout << "decode: " << decode / 1000.0 << "s" << std::endl;
-	std::cout << "ttft time: " << ttft / 1000.0 << "s" << std::endl;
+    // 数据布局转换：NCHW (84×8400) → anchor-major (8400×84)
+    float *transposed = (float *)malloc(NUM_ANCHORS * NUM_FEATURES * sizeof(float));
+    if (!transposed)
+    {
+        cerr << "Error: malloc failed for transposed buffer" << endl;
+        rknn_outputs_release(ctx, 1, outputs);
+        free(input_data);
+        rkllm_destroy(llmHandle);
+        rknn_destroy(ctx);
+        return 1;
+    }
 
-	// ====== 6. 释放资源 ======
-	rknn_outputs_release(ctx, 1, outputs); // 释放输出 buffer
-	free(input_data);					   // 释放输入 buffer
-	rknn_destroy(ctx);					   // 销毁 context
-	printf("rknn_destroy OK\n");
-	rkllm_destroy(llmHandle);
-	printf("rkllm destroy OK\n");
-	return 0;
+    for (int i = 0; i < NUM_ANCHORS; i++)
+        for (int c = 0; c < NUM_FEATURES; c++)
+            transposed[i * NUM_FEATURES + c] = output_data[c * NUM_ANCHORS + i];
+
+    vector<vector<float>> boxes;
+    vector<float> scores;
+    vector<int> classes;
+    postprocess(transposed, boxes, classes, scores, conf_thres, iou_thres);
+    free(transposed);
+
+    cout << "[YOLO] detected " << boxes.size() << " objects" << endl;
+    for (size_t i = 0; i < boxes.size(); i++)
+        cout << "  " << COCO_CLASSES[classes[i]] << ", score=" << scores[i] << endl;
+
+    // ====== 7. 构建 prompt + LLM 推理 ======
+    int class_count[80] = {0};
+    for (size_t i = 0; i < boxes.size(); i++)
+        class_count[classes[i]]++;
+
+    string prompt = "请用一句话描述这个场景,只根据给出的物体列表描述，不要添加列表之外的细节。图片中检测到：";
+    for (int j = 0; j < 80; j++)
+    {
+        if (class_count[j] > 0)
+        {
+            prompt += to_string(class_count[j]) + "个" + COCO_CLASSES[j] + ",";
+        }
+    }
+
+    RKLLMInput rkllm_input;
+    memset(&rkllm_input, 0, sizeof(RKLLMInput));
+    rkllm_input.input_type = RKLLM_INPUT_PROMPT;
+    rkllm_input.prompt_input = (char *)prompt.c_str();
+
+    RKLLMInferParam rkllm_infer_params;
+    memset(&rkllm_infer_params, 0, sizeof(RKLLMInferParam));
+
+    t0 = chrono::steady_clock::now();
+    token_count = 0;
+
+    auto llm_start = chrono::high_resolution_clock::now();
+    rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+    auto llm_end = chrono::high_resolution_clock::now();
+
+    // ====== 8. 性能统计 ======
+    auto yolo_ms = chrono::duration_cast<chrono::milliseconds>(yolo_end - yolo_start).count();
+    auto llm_ms = chrono::duration_cast<chrono::milliseconds>(llm_end - llm_start).count();
+    auto ttft = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count();
+    auto decode = chrono::duration_cast<chrono::milliseconds>(t2 - t1).count();
+    double tokens_per_s = token_count / (decode / 1000.0);
+
+    cout << endl
+         << "===== Performance =====" << endl
+         << "YOLO:     " << yolo_ms << " ms" << endl
+         << "LLM:      " << llm_ms << " ms" << endl
+         << "TTFT:     " << ttft / 1000.0 << " s" << endl
+         << "Decode:   " << decode / 1000.0 << " s (" << tokens_per_s << " tok/s)" << endl;
+
+    // ====== 9. 释放资源 ======
+    rknn_outputs_release(ctx, 1, outputs);
+    free(input_data);
+    rknn_destroy(ctx);
+    rkllm_destroy(llmHandle);
+
+    return 0;
 }
