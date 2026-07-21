@@ -2,40 +2,31 @@
 
 在 Orange Pi 5 Pro (RK3588S, 6 TOPS NPU) 上部署 **YOLOv8n 目标检测 + Qwen2.5-0.5B 场景描述** 的双模型协同推理管线，端到端延迟 ~314ms。
 
+![Platform](https://img.shields.io/badge/platform-Orange%20Pi%205%20Pro-orange)
+![NPU](https://img.shields.io/badge/NPU-RK3588S%206%20TOPS-blue)
+![Status](https://img.shields.io/badge/status-completed-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
+## 管线架构
+
+```mermaid
+graph TD
+    A[🖼️ 输入图片] --> B[OpenCV 预处理<br/>resize → 640×640]
+    B --> C[YOLOv8n NPU 推理<br/>FP16 · 33ms]
+    C --> D[C++ 后处理<br/>NMS + decode]
+    D --> E[构建 Prompt]
+    E --> F[Qwen2.5-0.5B NPU 推理<br/>W8A8 · 281ms]
+    F --> G[📝 场景描述文本]
+    
+    style C fill:#4CAF50,color:#fff
+    style F fill:#2196F3,color:#fff
 ```
-输入图片 (任意尺寸)
-    │
-    ▼
-┌─────────────────────┐
-│ ① 预处理 (OpenCV)    │  resize → 640×640, 归一化
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ ② YOLOv8n (NPU)     │  rknn_run, 33ms, FP16
-│     目标检测          │  输出: 1×84×8400 张量
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ ③ 后处理 (C++)       │  NMS + decode
-│     解码检测框        │  → "person×4, bus×1"
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ ④ 构建 Prompt       │  检测结果 → 自然语言指令
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ ⑤ Qwen2.5-0.5B      │  rkllm_run, 281ms, W8A8
-│     场景描述 (NPU)    │  TTFT ~90ms, ~40 tok/s
-└──────────┬──────────┘
-           │
-           ▼
- "一辆公交车上坐着四个人。"
-```
+
+## 动机
+
+**为什么是双模型而不是多模态大模型？** 端侧多模态模型（如 Qwen2.5-VL）在 0.5B 规模的视觉理解能力极弱。YOLOv8n（33ms）擅长目标检测，Qwen2.5-0.5B 擅长文本生成——两个小模型各司其职，比一个大模型勉强做两件事效果更好，且 NPU 分时调度即可，无需额外算力。
+
+**为什么选这两个型号？** **YOLOv8n**：最小的 YOLOv8 变体，检测精度够用，推理 ~33ms。**Qwen2.5-0.5B**：端侧能跑的最小可用 LLM，W8A8 压缩后 764MB。两个模型加起来能在 8GB 板端内存共存。这个组合证明了"端侧视觉理解"的可行性下限——两三年后模型更小更快，方案会更成熟。
 
 ## 快速开始
 
@@ -80,7 +71,7 @@ export LD_LIBRARY_PATH=/path/to/libs:$LD_LIBRARY_PATH
 | 双模型内存占用       | ~1.5 GiB     |
 | 板端剩余内存         | ~5.5 GiB     |
 
-> LLM 占端到端延迟 ~90%，YOLO 几乎不拖后腿。优化重点在 LLM 侧。
+> LLM 占端到端延迟 ~90%，YOLO 几乎不拖后腿。优化重点在 LLM 侧。LLM 推理数据基于 W8A8 量化模型（943MB→764MB）。
 
 ## 效果展示
 
@@ -93,6 +84,8 @@ export LD_LIBRARY_PATH=/path/to/libs:$LD_LIBRARY_PATH
 | 🚗 cars_people.jpg | 19人 17车 | "有19个人、17辆汽车。"     | ⚠️ 密集漏检 |
 
 **边界分析**：YOLOv8n 是 nano 版本（COCO mAP 37.3%），简单场景精准，密集遮挡场景存在漏检误检。这是 nano 版本的速度-精度 design tradeoff，不是 pipeline 缺陷。详见 [`docs/perf_baseline.md`](docs/perf_baseline.md)。
+
+▶️ **[观看完整 Demo 视频](docs/demo.mp4)**（2.5 分钟，含实时推理过程）
 
 ## 技术栈
 
