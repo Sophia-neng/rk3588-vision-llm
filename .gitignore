@@ -24,3 +24,7 @@ docs/interview_qa.docx
 src/liu.c
 src/postprocess_rewrite.cpp
 src/rknn_exercise.c
+*pt
+*.onnx
+rknn-llm/
+models/

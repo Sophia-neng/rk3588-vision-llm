@@ -203,3 +203,36 @@
 **教训**：
 - 端侧小模型（0.5B）管不住自己，用 prompt 替它管
 - 约束还顺带提升性能：无约束 TTFT 252ms → 加约束 96ms
+
+---
+
+## 15. INT8 量化 YOLOv8n：class score 全塌，5 种混合精度方案均无效
+
+**日期**：2026-07-20
+
+**问题**：YOLOv8n ONNX → RKNN W8A8 INT8 量化后，板端推理检出 0 objects。所有 class score 通道输出全为 0，仅坐标通道（cx/cy/w/h）值合理。
+
+**定位**：dump FP16 vs INT8 输出逐位对比：
+- 坐标通道值接近（cx~247 vs 5，cy~374 vs 18，不同 anchor 而已）
+- FP16 最高 person score：0.8838（anchor 8227）
+- INT8 最高 person score：0.0000（所有 8400 个 anchor 的 80 类 score 全塌）
+
+**尝试的 5 种混合精度配置**：
+
+| 配置 | 结果 |
+|------|------|
+| w8a8 全 INT8 | ❌ |
+| `auto_hybrid_cos_thresh=0.95` | ❌ |
+| `auto_hybrid_cos_thresh=0.80` | ❌ |
+| `quantized_hybrid_level=3` | ❌ |
+| `quantized_method="channel"` + `optimization_level=0` | ❌ |
+
+全部在板端检出 0 objects。
+
+**根因分析**：YOLO 检测头的 Sigmoid + class score 层对 INT8 量化极度敏感。Sigmoid 输出在 0-1 之间，INT8 只有 -128~127 的整数表达力，细粒度的小数被量化噪声淹没。RKNN Toolkit2 2.3.2 的自动混合精度（auto_hybrid_cos_thresh / quantized_hybrid_level）理论上应该识别这些层并保留 FP16，但实际未生效——可能因为 RK3588 NPU 的硬件限制或 SDK 2.3.2 的 bug。
+
+**教训**：
+- 检测模型的量化难点不在 backbone，在检测头。分类置信度比坐标回归敏感得多。
+- RKNN Toolkit2 的自动混合精度不能完全信任——对关键模型需要手动验证。
+- INT8 量化在 ResNet/MobileNet 分类模型上成熟，但在 YOLO 检测模型上仍需要更精细的手动混合精度或用更大的校准数据集（500-1000 张）。
+- **面试加分项**：亲自踩过量化失败的所有坑，比直接跑通的人多一个维度——你知道"不什么不能做"。
